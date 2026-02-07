@@ -1,176 +1,238 @@
-#!/usr/bin/env python3
-"""
-PDF Parser using Docling - Updated Version
-Converts PDF question papers and marking schemes to Markdown format
-Extracts images to a separate folder
-Optimized for systems with 16GB RAM and no GPU
-"""
-
-import os
 import sys
-from pathlib import Path
-from typing import Optional
+import os
+import re
+import json
 import logging
+from pathlib import Path
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.base_models import InputFormat
 
-# Configure logging
+# ----------------------------
+# Logging Setup
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Extractor")
 
+# ----------------------------
+# Regex Patterns
+# ----------------------------
+# Matches: "1.", "Question 1", "1 (a)", "2(b)(i)"
+QUESTION_PATTERN = re.compile(r"^(?:Question\s+)?(\d+)(?:\s*[\.\(]?\s*([a-z]|[iv]+)[\)\.]?)?", re.IGNORECASE)
+# Matches marks: "[4]", "[4 marks]", "(4)"
+MARKS_PATTERN = re.compile(r"[\[\(](\d+)\s*marks?[\]\)]", re.IGNORECASE)
 
-def parse_pdf_to_markdown(
-    pdf_path: str,
-    output_dir: str = "output",
-    images_dir: str = "images"
-) -> Optional[str]:
+class SmartChunker:
     """
-    Parse a PDF file to Markdown format using Docling
-    
-    Args:
-        pdf_path: Path to the input PDF file
-        output_dir: Directory to save the markdown output
-        images_dir: Directory to save extracted images
-        
-    Returns:
-        Path to the generated markdown file, or None if failed
+    A state-machine based chunker that keeps Tables and Code Blocks intact.
     """
-    try:
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-        from docling_core.types.doc import PictureItem, TableItem
+    def __init__(self, text, source_name):
+        self.lines = text.splitlines()
+        self.source = source_name
+        self.chunks = []
         
-        logger.info(f"Processing PDF: {pdf_path}")
+        # Buffers
+        self.current_chunk_lines = []
+        # "Sticky" metadata that persists until a new question is found
+        self.current_metadata = {"question": None, "subpart": None, "marks": None}
         
-        # Create output directories
-        output_path = Path(output_dir)
-        images_path = Path(images_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        images_path.mkdir(parents=True, exist_ok=True)
+        # State Flags
+        self.in_code_block = False
+        self.in_table = False
+
+    def flush(self, chunk_type="text"):
+        """Compiles the current buffer into a chunk."""
+        if not self.current_chunk_lines:
+            return
+
+        text = "\n".join(self.current_chunk_lines).strip()
         
-        # Configure pipeline for low-resource systems
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = False  # Disable OCR to save memory
-        pipeline_options.do_table_structure = True
-        pipeline_options.images_scale = 1.0  # Don't upscale images
-        pipeline_options.generate_page_images = False  # Save memory
+        # Skip empty or noise chunks (e.g. just a pipe | or page numbers)
+        if len(text) < 5 or text == "|":
+            self.current_chunk_lines = []
+            return
+
+        # Unique ID for RAG
+        chunk_id = f"{self.source}_{chunk_type}_{len(self.chunks):03d}"
         
-        # Initialize converter with optimized settings
-        converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=pipeline_options,
-                    backend=PyPdfiumDocumentBackend
-                )
+        chunk_obj = {
+            "id": chunk_id,
+            "text": text,
+            "metadata": {
+                "source": self.source,
+                "type": chunk_type,
+                # Copy current metadata state
+                "question": self.current_metadata["question"],
+                "subpart": self.current_metadata["subpart"],
+                "marks": self.current_metadata["marks"]
             }
-        )
+        }
+        self.chunks.append(chunk_obj)
+        self.current_chunk_lines = []
+
+    def update_metadata(self, line):
+        """Updates question/marks context based on the current line."""
+        stripped = line.strip()
         
-        # Convert the PDF
-        logger.info("Converting PDF to document format...")
-        result = converter.convert(pdf_path)
+        # --- STRATEGY 1: Standard Heading Detection (e.g. "1. Question") ---
+        match = QUESTION_PATTERN.match(stripped)
         
-        # Get the base filename without extension
-        pdf_filename = Path(pdf_path).stem
+        # --- STRATEGY 2: Table Row Detection (e.g. "| 1 | (a) | ...") ---
+        # If the line starts with pipe |, the regex above fails. We must peek inside the cell.
+        if not match and stripped.startswith("|"):
+            # Split by pipe and get the first non-empty content
+            parts = [p.strip() for p in stripped.split("|") if p.strip()]
+            if parts:
+                # Check if the first cell is a number (Question ID)
+                first_cell_match = QUESTION_PATTERN.match(parts[0])
+                if first_cell_match:
+                    match = first_cell_match
+                    # If we found a question number, check second cell for subpart (e.g. "(a)")
+                    if len(parts) > 1:
+                        sub_match = re.match(r"^\(?([a-z]|[iv]+)\)?", parts[1], re.IGNORECASE)
+                        if sub_match:
+                            self.current_metadata["subpart"] = sub_match.group(1)
+
+        # --- APPLY UPDATES ---
+        if match:
+            # If we found a NEW question, save the OLD chunk first
+            if not self.in_table and not self.in_code_block:
+                self.flush("text")
+                
+            q_num = match.group(1)
+            sub_part = match.group(2)
+            
+            # Update State
+            self.current_metadata["question"] = q_num
+            if sub_part:
+                self.current_metadata["subpart"] = sub_part
+            
+            # Reset marks/subpart if it's a new main question number (e.g. going from 1b to 2)
+            if not sub_part:
+                self.current_metadata["marks"] = None
+                self.current_metadata["subpart"] = None 
+
+        # --- STRATEGY 3: Marks Detection ---
+        mark_match = MARKS_PATTERN.search(line)
+        if mark_match:
+            self.current_metadata["marks"] = mark_match.group(1)
+
+    def process(self):
+        for line in self.lines:
+            stripped = line.strip()
+
+            # --- CASE 1: CODE BLOCKS (```) ---
+            if stripped.startswith("```"):
+                if self.in_code_block:
+                    # Closing fence -> Save Code Block
+                    self.current_chunk_lines.append(line)
+                    self.flush("code")
+                    self.in_code_block = False
+                else:
+                    # Opening fence -> Save previous text first
+                    self.flush("text") 
+                    self.in_code_block = True
+                    self.current_chunk_lines.append(line)
+                continue
+            
+            if self.in_code_block:
+                self.current_chunk_lines.append(line)
+                continue
+
+            # --- CASE 2: TABLES ---
+            # Line is part of a table if it has pipes AND isn't just a single char
+            is_table_row = stripped.startswith("|") and (stripped.endswith("|") or len(stripped.split("|")) > 2)
+            
+            if is_table_row:
+                if not self.in_table:
+                    # Start of new table -> Save previous text
+                    self.flush("text")
+                    self.in_table = True
+                
+                # Check for metadata INSIDE the table row
+                self.update_metadata(line)
+                self.current_chunk_lines.append(line)
+                continue
+            else:
+                if self.in_table:
+                    # End of table -> Save Table
+                    self.flush("table")
+                    self.in_table = False
+
+            # --- CASE 3: STANDARD TEXT ---
+            self.update_metadata(line)
+            self.current_chunk_lines.append(line)
+
+        # Final flush for any remaining text
+        if self.in_table: self.flush("table")
+        elif self.in_code_block: self.flush("code")
+        else: self.flush("text")
         
-        # Export to Markdown
-        markdown_filename = f"{pdf_filename}.md"
-        markdown_path = output_path / markdown_filename
+        return self.chunks
+
+def run_extraction_pipeline(pdf_path):
+    # 1. Clean Path (Fixes Mac drag-and-drop artifacts)
+    pdf_path = pdf_path.strip().strip("'").strip('"')
+    
+    if not os.path.exists(pdf_path):
+        logger.error(f"File not found: {pdf_path}")
+        return
+
+    file_name = Path(pdf_path).stem
+    output_dir = Path("output_jsonl")
+    output_dir.mkdir(exist_ok=True)
+
+    # 2. Configure Docling (FAST MODE - No OCR download)
+    logger.info("Initializing Docling Pipeline...")
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = False               # DISABLED to prevent download errors
+    pipeline_options.do_table_structure = True    # Keep table detection
+    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+    pipeline_options.generate_page_images = False    
+    pipeline_options.generate_picture_images = False 
+
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+        }
+    )
+
+    # 3. Process
+    logger.info(f"Processing: {file_name}")
+    try:
+        doc = converter.convert(pdf_path)
+        markdown_text = doc.document.export_to_markdown()
         
-        logger.info(f"Exporting to Markdown: {markdown_path}")
-        
-        # Export markdown
-        markdown_content = result.document.export_to_markdown()
-        
-        # Extract images
-        image_counter = 0
-        try:
-            # Iterate through document items to find images
-            for idx, item in enumerate(result.document.body.iterate_items()):
-                if isinstance(item, PictureItem):
-                    try:
-                        if hasattr(item, 'image') and item.image:
-                            image_filename = f"{pdf_filename}_image_{image_counter+1}.png"
-                            image_path = images_path / image_filename
-                            
-                            # Save the image
-                            item.image.save(str(image_path))
-                            logger.info(f"Saved image: {image_path}")
-                            image_counter += 1
-                            
-                    except Exception as e:
-                        logger.warning(f"Failed to save image {idx}: {e}")
-                        
-        except Exception as e:
-            logger.warning(f"Could not extract images: {e}")
-        
-        # Write markdown file
-        with open(markdown_path, 'w', encoding='utf-8') as f:
-            f.write(markdown_content)
-        
-        logger.info(f"✓ Successfully created: {markdown_path}")
-        logger.info(f"✓ Extracted {image_counter} images to: {images_path}")
-        
-        return str(markdown_path)
-        
-    except ImportError as e:
-        logger.error(f"Missing required dependency: {e}")
-        logger.error("Please install dependencies: pip install -r requirements.txt")
-        return None
+        # 4. Chunk with Smart Logic
+        chunker = SmartChunker(markdown_text, file_name)
+        chunks = chunker.process()
+
+        # 5. Save
+        output_file = output_dir / f"{file_name}.jsonl"
+        with open(output_file, "w", encoding="utf-8") as f:
+            for chunk in chunks:
+                f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+
+        logger.info(f"SUCCESS: Saved {len(chunks)} chunks to {output_file}")
+
     except Exception as e:
-        logger.error(f"Error processing PDF: {e}", exc_info=True)
-        return None
-
-
-def main():
-    """Main entry point"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Convert PDF question papers/marking schemes to Markdown"
-    )
-    parser.add_argument(
-        "pdf_file",
-        help="Path to the PDF file to convert"
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="output",
-        help="Directory for markdown output (default: output)"
-    )
-    parser.add_argument(
-        "--images-dir",
-        default="images",
-        help="Directory for extracted images (default: images)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Check if PDF file exists
-    if not os.path.exists(args.pdf_file):
-        logger.error(f"PDF file not found: {args.pdf_file}")
-        sys.exit(1)
-    
-    # Parse the PDF
-    result = parse_pdf_to_markdown(
-        args.pdf_file,
-        args.output_dir,
-        args.images_dir
-    )
-    
-    if result:
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Conversion completed successfully!")
-        logger.info(f"Markdown file: {result}")
-        logger.info(f"Images folder: {args.images_dir}")
-        logger.info(f"{'='*60}")
-        sys.exit(0)
-    else:
-        logger.error("Conversion failed!")
-        sys.exit(1)
-
+        logger.error(f"Extraction Failed: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    # Auto-detect or use command line arg
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+    else:
+        # Check current folder for PDFs
+        pdfs = [f for f in os.listdir(".") if f.lower().endswith(".pdf")]
+        if pdfs:
+            target = pdfs[0]
+            logger.info(f"Auto-detected PDF: {target}")
+        else:
+            target = input("Enter path to PDF: ").strip('"')
+            
+    run_extraction_pipeline(target)
